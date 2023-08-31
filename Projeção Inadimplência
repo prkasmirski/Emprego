@@ -1,0 +1,161 @@
+library(vars)
+library(BVAR)
+library(urca)
+library(tidyr)
+library(dplyr)
+library(tseries)
+library(zoo)
+library(purrr)
+library(lubridate)
+library(tibble)
+library(GetBCBData)
+library(rbcb)
+library(sidrar)
+
+# Séries observadas
+# Inadimplência mensal
+inadim <- gbcbd_get_series(
+  id = c("inadimplencia" = 21082),
+  first.date = "2011-04-01",
+  last.date = Sys.Date(),
+  format.data = "wide")
+inadim <- inadim %>%
+  mutate(mes_ano = as.yearmon(ref.date, "%b %Y")) %>%
+  select(!ref.date)
+
+# Média mensal da selic anualizada diária
+selic <- gbcbd_get_series(
+  c("selic" = 1178),
+  first.date = "2011-04-01",
+  last.date = Sys.Date(),
+  format.data = "wide")
+selic <- selic %>%
+  mutate(mes_ano = as.yearmon(ref.date, "%b %Y")) %>%
+  group_by(mes_ano) %>%
+  summarise(selic = mean(selic))
+
+# IPCA acumulado 12 meses
+ipca <- gbcbd_get_series(
+  id = c("ipca" = 13522),
+  first.date = "2011-04-01",
+  last.date = Sys.Date(),
+  format.data = "wide")
+ipca <- ipca %>%
+  mutate(mes_ano = as.yearmon(ref.date, "%b %Y")) %>%
+  select(!ref.date)
+
+# Desemprego mensal
+des <- gbcbd_get_series(
+  id = c("desemprego" = 24369),
+  first.date = "2011-04-01",
+  last.date = Sys.Date(),
+  format.data = "wide")
+des <-  des %>%
+  mutate(mes_ano = as.yearmon(ref.date, "%b %Y")) %>%
+  select(mes_ano, desemprego)
+
+# Base vai até maio/23
+base <- merge(inadim, selic, by = "mes_ano")
+base <- base %>%
+  merge(ipca, by = "mes_ano") %>%
+  merge(des, by = "mes_ano") %>%
+  select(!mes_ano)
+
+# Estacionariedade - não há evidências de não-estacionariedade
+adf.test(inadim$inadimplencia)
+adf.test(selic$selic)
+adf.test(ipca$ipca)
+adf.test(des$desemprego)
+
+# Escolha do lag -> p = 2
+VARselect(base, lag.max = 10, season = 12)
+
+# Modelo
+modelo <- VAR(base, p = 2, season = 12)
+summary(modelo)
+
+modelo_b <- bvar(base, lags = 2)
+summary(modelo_b, 1L)
+
+# Verificação dos betas
+ir_selic <- irf(modelo, impulse = "selic", response = "inadimplencia", n.ahead = 20, ortho = FALSE)
+plot(ir_selic)
+
+ir_ipca <- irf(modelo, impulse = "ipca", response = "inadimplencia", n.ahead = 20, ortho = FALSE)
+plot(ir_ipca)
+
+ir_des <- irf(modelo, impulse = "desemprego", response = "inadimplencia", n.ahead = 20, ortho = FALSE)
+plot(ir_des)
+
+# Projeção
+
+# Inputs - expectativas de mercado do Focus
+#Última expectativa da Selic
+dias <- as.Date(c("2023-09-19", "2023-10-31", "2023-12-12", "2024-01-30", "2024-03-19", "2024-05-07", "2024-06-18", "2024-07-30", "2024-09-17", "2024-11-05", "2024-12-10"))
+expec_r <- c(12.75, 12.25, 11.75, 11.25, 10.75, 10.25, 9.75, 9.25, 9, 9, 9)
+dias_r <- tibble(dias, expec_r)
+datas <- as.data.frame(as.Date(as.Date("2023-09-01"):as.Date("2025-12-31"), origin="1970-01-01"))
+colnames(datas) <- c("dias")
+selic1 <- fill(left_join(datas, dias_r, by = "dias"), expec_r, .direction = "up")
+selic1 <- selic1 %>%
+  mutate(mes_ano = as.yearmon(dias, "%b %Y")) %>%
+  group_by(mes_ano) %>%
+  summarise(selic = mean(expec_r))
+
+selic2 <- tail(selic, 3L)
+P_selic <- rbind(selic2, selic1)
+
+ipca1 <- get_market_expectations(
+  type = "monthly",
+  indic = c("IPCA"),
+  start_date = "2023-06-01",
+  end_date = "2024-07-31",
+  keep_names = TRUE)
+ipca1 <- ipca1 %>%
+  filter(Data==max(Data) & baseCalculo==0) %>%
+  mutate(mes = as.integer(substring(DataReferencia, 1, 2)), ano = as.integer(substring(DataReferencia, 4, 7))) %>%
+  arrange(ano, mes) %>%
+  rename(ipca_mes = Mediana) %>%
+  mutate(dia = "01", tempo = as.Date(paste(ano, mes, dia, sep = "-")), mes_ano = as.yearmon(tempo, "%b %Y")) %>%
+  select(tempo, mes_ano, ipca_mes)  
+
+ipca2 <- gbcbd_get_series(
+  id = c("ipca_mes" = 433),
+  first.date = "2022-09-01",
+  last.date = Sys.Date(),
+  format.data = "wide")
+ipca2 <- ipca2 %>%
+  mutate(mes_ano = as.yearmon(ref.date, "%b %Y")) %>%
+  rename(tempo = ref.date) %>%
+  select(tempo, mes_ano, ipca_mes)
+  
+P_ipca <- rbind(ipca2, ipca1) %>%
+  mutate(ipca = map_dbl(tempo, ~sum(ipca_mes[tempo > (.x - months(12)) & tempo <= .x]))) %>%
+  filter(tempo >= "2023-08-01") %>%
+  select(mes_ano, ipca)
+
+P_des <- get_market_expectations(
+  type = "monthly",
+  indic = c("Taxa de desocupação"),
+  start_date = "2023-01-01",
+  end_date = "2024-07-31",
+  keep_names = TRUE)
+P_des <- P_des %>%
+  filter(Data==max(Data) & baseCalculo==0) %>%
+  mutate(mes = as.integer(substring(DataReferencia, 1, 2)), ano = as.integer(substring(DataReferencia, 4, 7))) %>%
+  mutate(dia = "01", tempo = as.Date(paste(ano, mes, dia, sep = "-")), mes_ano = as.yearmon(tempo, "%b %Y")) %>%
+  arrange(ano, mes) %>%
+  select(mes_ano, Mediana) %>%
+  rename(desemprego = Mediana)
+P_des <- rbind(data.frame(mes_ano = as.yearmon(as.Date("2023-06-01"), "%b %Y"), desemprego = tail(des, 1L)[1,2]), P_des)
+
+base_p <- merge(P_selic, P_ipca, by = "mes_ano")
+base_p <- base_p %>%
+  merge(P_des, by = "mes_ano") %>%
+  #mutate(inadimplencia = NA) %>%
+  select(selic, ipca, desemprego)
+
+# Projeção
+bv_fcast(horizon = 12, cond_path = as.matrix(base_p), cond_vars = c(2, 3, 4))
+projecao <- predict(modelo_b)
+plot(projecao, vars = c("inadimplencia"))
